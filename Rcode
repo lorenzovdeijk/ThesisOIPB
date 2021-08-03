@@ -1,0 +1,366 @@
+#loaddata
+orderlvl <- read.csv("/users/lorenzo/documents/BIM/thesis/data/orders.csv")
+articlelvl <- read.csv("/users/lorenzo/documents/BIM/thesis/data/order_products__prior.csv")
+departments <- read.csv("/users/lorenzo/documents/BIM/thesis/data/departments.csv")
+aisles <- read.csv("/users/lorenzo/documents/BIM/thesis/data/aisles.csv")
+products <- read.csv("/users/lorenzo/documents/BIM/thesis/data/products.csv")
+
+ds1_baskets1 <- read.csv("/users/lorenzo/documents/BIM/thesis/data/crucials/ds1_baskets1.csv")
+ds1_impulsescores1 <- read.csv2("/users/lorenzo/documents/BIM/thesis/data/crucials/ds1_impulsescores1.csv")
+ds1_cluster1_all <- read.csv2("/users/lorenzo/documents/BIM/thesis/data/crucials/ds1_cluster1_all.csv")
+
+
+#loadpackages
+#load dplyr package to do data manipulation tasks
+library(dplyr)
+library(RSQLite) 
+library(sqldf) 
+library(ggplot2) 
+library(psych)
+library (arules)
+library(xlsx)
+library(rJava)
+library(openxlsx)
+
+
+
+#STEP 1.. merge tables to have one data set with product names, department names and aisle names
+products1 <- merge(x = products, y = departments, by = "department_id", all = TRUE)
+products2 <- merge(x = products1, y = aisles, by = "aisle_id", all = TRUE)
+
+aisles1 <- subset(products2, select = -c(department_id,department,aisle,product_name))
+
+#STEP 2 Calculate impulsiveness score-----------------------------------------------------------------------------------------------------
+
+#STEP 2.1 exclude irrelevant columns from articlelvl and order
+orderlvl2 <- subset(orderlvl, select = -c(eval_set,order_number,order_dow,order_hour_of_day,days_since_prior_order) )
+articlelvl2 <- subset(articlelvl, select = -c(add_to_cart_order,reordered))
+
+#STEP 2.2 merge articlelvl2 with orderlvl2 to have one table with userid, orderid and productid
+articlelvl3 <- merge(x = articlelvl2, y = orderlvl2, by = "order_id", all.x = TRUE)
+
+#STEP 2.3 export articlelvl3 to computer
+write.csv(articlelvl3,"/users/lorenzo/documents/BIM/thesis/ds_baskets.csv", row.names = FALSE)
+
+#STEP 2.4 load ds_impulsiveness_score.csv
+ds_baskets <- read.csv("/users/lorenzo/documents/BIM/thesis/data/ds_baskets.csv")
+ds1_baskets <- merge(x = ds_baskets, y = products2, by = "product_id", all.x = TRUE)
+ds1_baskets1 <- subset(ds1_baskets, select = -c(department_id,product_id,product_name,department,aisle))
+write.csv(ds1_baskets1,"/users/lorenzo/documents/BIM/thesis/ds1_baskets1.csv", row.names = FALSE)
+
+
+#STEP 2.5 Calculate impulsiveness score per customer (= (SUM(count product_id_x / unique count order_id))/unique count aisle_id)
+
+#STEP 2.5.1 Create datasets with # of unique orders per customers (ds_dorders) and  # of unique aisle bought per customers (ds_dproducts)
+# Optionally: write SQL queries in R. For documentation, check: https://db.rstudio.com/getting-started/database-queries/
+aisle_id = ds1_baskets1[,3]
+user_id = ds1_baskets1 [,2]
+order_id = ds1_baskets1 [,1]
+
+ds_dorders = sqldf('SELECT user_id, COUNT(DISTINCT order_id) AS total_dorders
+                          FROM ds1_baskets1
+                          GROUP BY user_id' )
+
+ds_daisle = sqldf('SELECT user_id, COUNT(DISTINCT aisle_id) AS total_dproducts
+                                       FROM ds1_baskets1 
+                                       GROUP BY user_id') 
+
+#STEP 2.5.2 Create dataset with impulse score per aisle per customer (ds_impulse1)
+ds1_purchasefreq = sqldf('SELECT user_id, aisle_id, COUNT(DISTINCT order_id) AS purchase_frequency
+                                       FROM ds1_baskets1 
+                                       GROUP BY user_id, aisle_id')
+
+ds1_impulse1 <- merge(x = ds1_purchasefreq, y = ds_dorders, by = "user_id", all.x = TRUE)
+ds1_impulse1$impulsescore <- ds1_impulse1$purchase_frequency / ds1_impulse1$total_dorders
+
+
+#STEP 2.5.3 Create dataset with sum of impulse scores of products per customer (ds_impulse2)
+ds1_impulse2 = sqldf('SELECT user_id, SUM(impulsescore)
+                                 FROM ds1_impulse1
+                                 GROUP BY user_id')
+
+#STEP 2.5.4 Create dataset with impulse score per customer (ds_impulsescores)
+ds1_impulse3 <- merge(x = ds1_impulse2, y = ds_daisle, by = "user_id", all.x = TRUE)
+ds1_impulse3$impulsiveness_score <- ds1_impulse3$`SUM(impulsescore)` / ds1_impulse3$total_dproducts
+
+ds1_impulsescores <- sqldf('SELECT user_id, impulsiveness_score
+                                 FROM ds1_impulse3')
+
+
+#STEP 3 Calculate average impulsiveness per order group
+ds1_impulsescores1 <- merge(x = ds1_impulsescores, y = ds_dorders, by = "user_id", all.y = TRUE)
+ds1_impulsescores2 <- sqldf('SELECT DISTINCT total_dorders, AVG(impulsiveness_score) AS avg_impulsiveness_score
+                               FROM ds1_impulsescores1
+                               GROUP BY total_dorders')
+
+barchart <- ggplot(ds1_impulsescores2) +
+  geom_bar(aes(total_dorders, avg_impulsiveness_score), position = "dodge", stat = "summary", fun.y = "mean") + labs(y = "Average", x = "Order amount", title = "Average impulsiveness score")
+barchart
+
+write.csv(ds1_impulsescores2,"/users/lorenzo/documents/BIM/thesis/ds1_impulsescores2.csv", row.names = FALSE)
+
+
+
+#STEP 4 Create sample population-----------------------------------------------------------------------------------------------------
+
+#STEP 4.1 Visualise potential samples
+histogram_sample <- ggplot(ds_dorders, aes(total_dorders)) +
+  geom_histogram(binwidth = 0.005) + labs(y = "frequency", title = "Histogram")
+
+histogram_sample
+
+#STEP 4.2 Choose a specific sample
+sqldf('SELECT COUNT(DISTINCT user_id)
+                        FROM ds1_impulsescores1
+                        WHERE total_dorders > 23')
+
+
+ds2_impulsescores_sample <- sqldf('SELECT user_id, impulsiveness_score, total_dorders
+                                   FROM ds1_impulsescores1
+                                   WHERE total_dorders > 23')
+
+ds2_impulsescores_sample <- merge(x = ds_impulsescores, y = ds_sample, by = "user_id", all.y = TRUE)
+
+
+ds_sample1 <- sqldf('SELECT DISTINCT total_dorders AS amounts, COUNT(user_id)
+                        FROM ds_dorders
+                        GROUP BY amounts')
+
+
+write.csv(ds2_impulsescores_sample,"/users/lorenzo/documents/BIM/thesis/ds2_impulsescores_sample.csv", row.names = FALSE)
+
+#Sample for mba
+
+
+
+ds1_mba_sampleh <- sample_n(ds1_mba_cluster1h, 1000000)
+ds1_mba_samplel <- sample_n(ds1_mba_cluster1h, 1000000)
+
+
+
+#STEP 5 Summary statistics of impulsiveness score-----------------------------------------------------------------------------------------------------
+
+#STEP 5.1 Summary statistic non-sample
+describeBy(ds2_impulsescores_sample)
+
+#STEP 5.2 Summary statistic sample
+describeBy(ds2_impulsescores_sample)
+
+
+
+#SETP 6 Plot histograms and normal distribution of impulsiveness score-----------------------------------------------------------------------------------------------------
+
+#STEP 6.1 Plot a histogram
+#6.1a WITHOUT log transform
+histogram <- ggplot(ds2_impulsescores_sample, aes(impulsiveness_score)) +
+  geom_histogram(binwidth = 0.005) + 
+  labs(y = "frequency", title = "Impulsiveness of customers")
+
+histogram
+
+#6.1b WITH log transform
+histogram <- ggplot(ds2_impulsescores_sample, aes(impulsiveness_score)) +
+  geom_histogram(binwidth = 0.005) +
+  scale_x_log10() + 
+  labs(y = "frequency", title = "Impulsiveness of customers")
+
+histogram
+
+#STEP 6.2 Plot a normal distribution
+#6.2a WITHOUT log transform
+ndistribution <- ggplot(ds2_impulsescores_sample, aes(x = impulsiveness_score)) + 
+  stat_function(fun = dnorm, args = list(mean = mean(ds2_impulsescores_sample$impulsiveness_score), sd = sd(ds2_impulsescores_sample$impulsiveness_score))) + 
+  labs(title = "Impulsiveness of customers")
+
+ndistribution
+
+#6.2b WITH log transform
+ndistribution <- ggplot(ds2_impulsescores_sample, aes(x = impulsiveness_score)) + 
+  stat_function(fun = dnorm, args = list(mean = mean(ds2_impulsescores_sample$impulsiveness_score), sd = sd(ds2_impulsescores_sample$impulsiveness_score))) +
+  scale_x_log10() + 
+  labs(title = "Impulsiveness of customers")
+
+ndistribution
+
+
+## KLADPAPIER 
+ggplot(ds_impulsescores1, aes(impulsiveness_score, total_dorders)) +
+  geom_point() +
+  scale_x_log10() + scale_y_log10() 
+
+
+
+
+
+
+
+#STEP 7 Clustering analysis-----------------------------------------------------------------------------------------------------
+
+    #7.1Clustering WITHOUT order amount variable
+    ds2_cluster_1var <- subset(ds2_impulsescores_sample, select = -c(user_id, total_dorders))
+    ds2_cluster1 <- kmeans(ds2_cluster_1var, 3) 
+    aggregate(ds2_cluster_1var,by=list(ds2_cluster1$cluster),FUN=mean)
+    ds2_cluster1a <- data.frame(ds2_cluster_1var, ds2_cluster1$cluster)
+
+#Export to csv, merge file with ds1_impulsescores and reupload
+write.csv(ds2_cluster1a,"/users/lorenzo/documents/BIM/thesis/ds2_cluster1a.csv", row.names = FALSE)
+ds2_cluster1_all <- read.csv2("/users/lorenzo/documents/BIM/thesis/data/crucials/ds2_cluster1_all.csv")
+
+#Histogram and barchart of clusters
+histogram <- ggplot(ds2_cluster1_all, aes(cluster)) +
+  geom_histogram(binwidth = 0.5) + 
+  labs(y = "frequency", title = "Count of customer per cluster")
+histogram
+
+bar <- ggplot(ds2_cluster1_all, aes(cluster, impulsiveness_score))
+bar + stat_summary(fun.y = mean, geom = "bar") + labs(x = "Cluster", y = "Mean Impulsiveness", title = "Impulsiveness per cluster")
+
+#Create separate datasets for the segments
+ds2_segment1_high <- sqldf('SELECT user_id, total_dorders, impulsiveness_score
+                        FROM ds2_cluster1_all
+                        WHERE cluster = 2')
+
+ds2_segment1_med <- sqldf('SELECT user_id, total_dorders, impulsiveness_score
+                        FROM ds2_cluster1_all
+                        WHERE cluster = 3')
+
+ds2_segment1_low <- sqldf('SELECT user_id, total_dorders, impulsiveness_score
+                        FROM ds2_cluster1_all
+                        WHERE cluster = 1')
+
+#Summary statistic, histogram and normal distribution of each segment
+describeBy(ds2_segment1_low)
+
+histogram <- ggplot(ds2_segment1_low, aes(impulsiveness_score)) +
+  geom_histogram(binwidth = 0.005) + 
+  labs(y = "frequency", title = "Impulsiveness of low-impulsive customers")
+histogram
+
+ndistribution <- ggplot(ds2_segment1_low, aes(x = impulsiveness_score)) + 
+  stat_function(fun = dnorm, args = list(mean = mean(ds2_segment1_low$impulsiveness_score), sd = sd(ds2_segment1_low$impulsiveness_score))) + 
+  labs(title = "Impulsiveness of low-impulsive customers")
+ndistribution
+
+
+#Visualise cluster
+library(cluster) 
+clusplot(fit, fit1$cluster, color=TRUE, shade=TRUE, 
+         labels=2, lines=0)
+library(fpc)
+plotcluster(fit, fit1$cluster)
+
+
+#STEP 8 Market basket analysis-----------------------------------------------------------------------------------------------------
+
+#STEP 8.1 Install packages
+install.packages ("arules")
+library (arules)
+
+#STEP 8.2 Prepare the data
+
+#8.2.1 Create dataset with transactions of segments
+ds2_mba_cluster1t <- merge(x = ds1_baskets1, y = ds2_cluster1_all, by = "user_id", all.y = TRUE)
+ds2_mba_cluster1h <- merge(x = ds1_baskets1, y = ds2_segment1_high, by = "user_id", all.y = TRUE)
+ds2_mba_cluster1m <- merge(x = ds1_baskets1, y = ds2_segment1_med, by = "user_id", all.y = TRUE)
+ds2_mba_cluster1l <- merge(x = ds1_baskets1, y = ds2_segment1_low, by = "user_id", all.y = TRUE)
+
+#8.2.2 Create dataset with transactions and product names (ds_transactions_sample)
+ds2_mba_cluster1t <- merge(x = ds2_mba_cluster1t, y = aisles, by = "aisle_id", all.x = TRUE)
+ds2_mba_cluster1h <- merge(x = ds2_mba_cluster1h, y = aisles, by = "aisle_id", all.x = TRUE)
+ds2_mba_cluster1m <- merge(x = ds2_mba_cluster1m, y = aisles, by = "aisle_id", all.x = TRUE)
+ds2_mba_cluster1l <- merge(x = ds2_mba_cluster1l, y = aisles, by = "aisle_id", all.x = TRUE)
+
+#8.2.3 Make subsets of the transactions to decrease the filesize
+ds2_mba_cluster1t <- subset(ds2_mba_cluster1t, select = -c(aisle_id,total_dorders,impulsiveness_score,user_id,cluster))
+ds2_mba_cluster1h <- subset(ds2_mba_cluster1h, select = -c(aisle_id,total_dorders,impulsiveness_score,user_id))
+ds2_mba_cluster1m <- subset(ds2_mba_cluster1m, select = -c(aisle_id,total_dorders,impulsiveness_score,user_id))
+ds2_mba_cluster1l <- subset(ds2_mba_cluster1l, select = -c(aisle_id,total_dorders,impulsiveness_score,user_id))
+
+#8.2.4 Create sample per segment with equal amount of transactions
+ds1_mba_sampleh <- sqldf('SELECT DISTINCT order_id
+                           FROM ds1_mba_cluster1h')
+ds1_mba_sampleh1 <- sample_n(ds1_mba_sampleh, 100000)
+ds1_mba_cluster1h_sample <- merge(x = ds1_mba_cluster1h, y = ds1_mba_sampleh1, by = "order_id", all.y = TRUE)
+
+ds1_mba_samplem <- sqldf('SELECT DISTINCT order_id
+                           FROM ds1_mba_cluster1m')
+ds1_mba_samplem1 <- sample_n(ds1_mba_samplem, 100000)
+ds1_mba_cluster1m_sample <- merge(x = ds1_mba_cluster1m, y = ds1_mba_samplem1, by = "order_id", all.y = TRUE)  
+
+ds1_mba_samplel <- sqldf('SELECT DISTINCT order_id
+                           FROM ds1_mba_cluster1l')
+ds1_mba_samplel1 <- sample_n(ds1_mba_samplel, 100000)
+ds1_mba_cluster1l_sample <- merge(x = ds1_mba_cluster1l, y = ds1_mba_samplel1, by = "order_id", all.y = TRUE)
+
+#8.2.5 Export data to xlsx, because read.transactions needs a xlsx as input. (Dont forget to include.xlsx in file name)
+write.table(ds2_mba_cluster1t,"/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1t.txt", sep = "\t")
+write.table(ds2_mba_cluster1h,"/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1h.txt", sep = "\t")
+write.table(ds2_mba_cluster1m,"/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1m.txt", sep = "\t")
+write.table(ds2_mba_cluster1l,"/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1l.txt", sep = "\t")
+
+#8.2.6 Import dataset for analysis
+ds2_mba_tot <- read.transactions("/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1t.txt", format = "single", cols = c(2,3), sep="\t", rm.duplicates=TRUE)
+ds2_mba_high <- read.transactions("/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1h.txt", format = "single", cols = c(2,3), sep="\t", rm.duplicates=TRUE)
+ds2_mba_med <- read.transactions("/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1m.txt", format = "single", cols = c(2,3), sep="\t", rm.duplicates=TRUE)
+ds2_mba_low <- read.transactions("/users/lorenzo/documents/BIM/thesis/ds2_mba_cluster1l.txt", format = "single", cols = c(2,3), sep="\t", rm.duplicates=TRUE)
+
+
+
+#STEP 8.3 (Perform analysis)
+
+    #STEP 8.3.1 Summary of baskets (number of items/transactions, frequency of basket sizes, most popular products etc.) 
+    summary(ds2_mba_low)
+
+    #STEP 8.3.2 Visual representation of relative and absolute frequency of popular items
+    item_freq <- sort(itemFrequency(ds2_mba_low,type="absolute"),decreasing=TRUE)
+    head(item_freq)
+    itemFrequencyPlot(ds2_mba_low,topN=15,type="absolute",col="wheat2",xlab="Item name",ylab="Frequency (absolute)", main="Top 15 articles by frequency")
+    itemFrequencyPlot(ds2_mba_tot,topN=20,type="relative",col="wheat2",xlab="Item name",ylab="Frequency (relative)", main="Top 20 articles by order penetration")
+    itemFrequency(ds2_mba_lowh,type="absolute")
+    itemFrequency(ds2_mba_low,type="relative")
+    
+      itemfrequency_tot <- itemFrequency(ds2_mba_tot,type="relative")
+      itemfrequency_tot <- format(round(itemfrequency_tot,5), nsmall = 5)
+      ds2_mba_if_tot <- data.frame(itemfrequency_tot)
+
+      itemfrequency_high <- itemFrequency(ds2_mba_high,type="relative")
+      itemfrequency_high <- format(round(itemfrequency_high,5), nsmall = 5)
+      ds2_mba_if_high <- data.frame(itemfrequency_high)
+      
+      itemfrequency_med <- itemFrequency(ds2_mba_med,type="relative")
+      itemfrequency_med <- format(round(itemfrequency_med,5), nsmall = 5)
+      ds2_mba_if_med <- data.frame(itemfrequency_med)
+      
+      itemfrequency_low <- itemFrequency(ds2_mba_low,type="relative")
+      itemfrequency_low <- format(round(itemfrequency_low,5), nsmall = 5)
+      ds2_mba_if_low <- data.frame(itemfrequency_low)
+
+
+    #STEP 8.3.3 Analysis of rules
+    supportLevels <- c(0.1 , 0.05, 0.01 , 0.005, 0.001, 0.0005)
+    confidenceLevels <- c(0.9, 0.8, 0.7, 0.6, 0.5)
+
+    #now you need to specify which support level you want to take. Choose the support level at each "supportLevels[..]".
+    rules_sup1 <- integer(length=5)
+    for (i in 1:length(confidenceLevels)) {
+  
+    rules_sup1[i] <- length (apriori (ds2_mba_high, parameter = list (sup = supportLevels[2], conf = confidenceLevels[i], target="rules")))
+      }
+    plot(confidenceLevels, rules_sup1, type="b", xlab="Confidence level",ylab="Number of rules found", main= "High - Apriori algorithm with a support level of 5%")
+    
+    rules_sup1_conf50 <- apriori(ds2_mba_high, parameter=list(sup=supportLevels[2], conf=confidenceLevels[4],target="rules"))
+    inspect(rules_sup1_conf50)
+    ds2_mba_rules_h <- DATAFRAME(rules_sup1_conf50)
+
+    write.csv(mba_l,"/users/lorenzo/documents/BIM/thesis/mba_l.csv", row.names = FALSE)
+    
+
+#ANOVA T TEST (http://www.sthda.com/english/wiki/one-way-anova-test-in-r)
+    
+    #prepare data to test items per order and order amount
+    
+    ds2_significance_test <- sqldf('SELECT user_id, order_id, COUNT(aisle_id)
+                                   FROM ds1_baskets1
+                                   GROUP BY order_id')
+    
+    ds2_significance_test <- merge(x = ds2_significance_test, y = ds2_cluster1_all, by = "user_id", all.x = TRUE)
